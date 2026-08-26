@@ -11,7 +11,7 @@
 Aerial_Autonomy_Challenge（IROS 2025 竞赛）。
 
 项目要求 Ubuntu 16/18/20.04 + ROS1，宿主是 Ubuntu 26.04 —— 装不了 Noetic，所以全部容器化。
-底座是 [rootless Docker](2026-08-25-rootless-docker.md)。
+底座是 [rootless Docker](../infra/2026-08-25-rootless-docker.md)。
 
 镜像 `diffrobot:noetic`（基于 `osrf/ros:noetic-desktop-full`），容器名 `diffrobot`，
 `~/diffrobot/ws` bind mount 到 `/ws`。Diff-Planner 已编译通过，RViz 仿真实测 31fps。
@@ -31,7 +31,7 @@ docker stop diffrobot          # 关机前停
 
 rootless 下容器 root == 宿主 major（uid 1001），所以 bind mount 的源码、X11 socket、
 xauth cookie **全部天然可读写** —— 完全避开了
-[Isaac Lab 那边 uid 1000 的三关权限地狱](2026-08-25-isaac-sim-lab.md)。
+[Isaac Lab 那边 uid 1000 的三关权限地狱](../isaaclab/2026-08-25-isaac-lab-setup.md)。
 
 这条路走得通的前提是 ROS / RViz 不像 Isaac Kit 那样拒绝 root。同样是 rootless Docker + GUI，
 两个项目的最优解完全相反，取决于容器里那个程序肯不肯用 root 跑。
@@ -79,5 +79,5 @@ Mid360 雷达的 UDP、PX4 的串口都接不进来。
 
 ## 相关
 
-- [rootless Docker 配置](2026-08-25-rootless-docker.md)
-- [Isaac Sim / Isaac Lab 环境](2026-08-25-isaac-sim-lab.md)
+- [rootless Docker 配置](../infra/2026-08-25-rootless-docker.md)
+- [Isaac Sim / Isaac Lab 环境](../isaaclab/2026-08-25-isaac-lab-setup.md)

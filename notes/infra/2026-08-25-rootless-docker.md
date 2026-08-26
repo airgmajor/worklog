@@ -36,10 +36,10 @@ rootless 不是免费的，以下几条后来在别的项目里都实际撞上�
 - 默认绑不了 1024 以下端口
 - 网络走 slirp4netns
 - **`--network=host` 不是真正的宿主网络**，而是 rootlesskit 的 netns
-  —— 这条后来直接导致 [无人机项目](2026-08-26-diffrobot-noetic.md) 的真机联调做不了
+  —— 这条后来直接导致 [无人机项目](../diffrobot/2026-08-26-noetic-container.md) 的真机联调做不了
 - 只能挂载当前用户有权限的目录
 
 ## 相关
 
-- [Isaac Sim / Isaac Lab 环境](2026-08-25-isaac-sim-lab.md) —— GPU 直通建在这套 rootless 之上
-- [DifferentialRobotics ROS1 复现环境](2026-08-26-diffrobot-noetic.md)
+- [Isaac Sim / Isaac Lab 环境](../isaaclab/2026-08-25-isaac-lab-setup.md) —— GPU 直通建在这套 rootless 之上
+- [DifferentialRobotics ROS1 复现环境](../diffrobot/2026-08-26-noetic-container.md)

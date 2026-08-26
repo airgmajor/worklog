@@ -6,7 +6,7 @@
 Isaac Lab 3.0.0，基础镜像 Isaac Sim 6.0.1-rc.7。容器内实测 torch 2.10.0+cu128，
 `torch.cuda.is_available()` 为 True。首次构建 21 分钟，镜像 48.6GB。
 
-前提是 [rootless Docker 那一套](2026-08-25-rootless-docker.md)。
+前提是 [rootless Docker 那一套](../infra/2026-08-25-rootless-docker.md)。
 
 ## 位置
 
@@ -104,6 +104,6 @@ TensorBoard / WebRTC 串流的端口访问需要另行处理。
 
 ## 相关
 
-- [rootless Docker 配置](2026-08-25-rootless-docker.md)
-- [DifferentialRobotics ROS1 复现环境](2026-08-26-diffrobot-noetic.md) —— 那边用 root 跑容器，
+- [rootless Docker 配置](../infra/2026-08-25-rootless-docker.md)
+- [DifferentialRobotics ROS1 复现环境](../diffrobot/2026-08-26-noetic-container.md) —— 那边用 root 跑容器，
   正好避开了这里的三关权限地狱，对比着看很说明问题

@@ -26,11 +26,158 @@ cd ~/diffrobot && ./run.sh
 cd /ws/Diff-Planner
 ```
 
-> **`source devel/setup.bash` 要不要手动执行？**
-> 不用。镜像在 `/etc/profile.d/ros_ws.sh` 里已经自动 source 了 ROS 和本工作空间。
-> 执行一遍也无害，习惯性敲上不会出错。
-> 但注意 `sh_files/` 下的脚本是 **zsh** 脚本（`#!/bin/zsh` + `source devel/setup.zsh`），
-> 它们自己会 source，不受 bash 环境影响。
+---
+
+## 0.1 每次 roslaunch 之前必须 `source devel/setup.bash`
+
+```bash
+cd /ws/Diff-Planner
+source devel/setup.bash     # ← 每开一个新终端、每次 roslaunch 之前都要执行
+roslaunch diff_planner run_sim_single.launch
+```
+
+**这不是可选步骤**，漏了就会看到：
+
+```
+[diff_planner] is not a package nor is it in the ROS_PACKAGE_PATH
+RLException: [run_sim_single.launch] is neither a launch file in package [diff_planner] nor is [diff_planner] a launch file name
+```
+
+下面把「为什么」拆开讲清楚。
+
+### 一、`devel/setup.bash` 到底改了什么
+
+catkin 编译完会在 `devel/` 下生成一个环境脚本。它不产出任何二进制，唯一作用是**改当前 shell 的环境变量**。
+在容器里实测对比：
+
+```bash
+# 没 source 时
+root@diffrobot:/ws/Diff-Planner# echo $ROS_PACKAGE_PATH
+/opt/ros/noetic/share
+
+# source 之后
+root@diffrobot:/ws/Diff-Planner# source devel/setup.bash
+root@diffrobot:/ws/Diff-Planner# echo $ROS_PACKAGE_PATH
+/ws/Diff-Planner/src:/opt/ros/noetic/share      # ← 多出来的这一段就是关键
+```
+
+被改写的主要有这几个：
+
+| 变量 | 作用 | 不 source 的后果 |
+|---|---|---|
+| `ROS_PACKAGE_PATH` | `rospack` / `roslaunch` 搜包的根目录列表 | 找不到 `diff_planner`、`map_generator`、`multipoint` 等本地包 |
+| `CMAKE_PREFIX_PATH` | catkin 查找依赖包的 CMake 配置 | 增量编译时找不到本工作空间已编译的包 |
+| `LD_LIBRARY_PATH` | 动态链接库搜索路径 | 节点启动瞬间 `error while loading shared libraries` |
+| `PATH` | 可执行文件搜索路径 | `rosrun` 起不来本工作空间的节点 |
+| `PYTHONPATH` | Python 模块搜索路径 | 自定义 msg/srv 的 Python 绑定 `ImportError` |
+| `ROS_MASTER_URI` 等 | roscore 地址 | 连不上 master |
+
+`roslaunch diff_planner run_sim_single.launch` 这条命令里，`diff_planner` 是**包名不是路径**。
+roslaunch 拿到包名后走 `rospack find`，而 `rospack` 只会在 `ROS_PACKAGE_PATH` 列出的目录里递归找
+`package.xml`。`/ws/Diff-Planner/src` 不在里面，包就等于不存在 —— 哪怕你此刻就站在这个目录下。
+**ROS 找包靠的是环境变量，不是当前工作目录。**
+
+### 二、为什么叫 overlay（覆盖层）
+
+ROS 环境是层层叠加的：
+
+```
+/opt/ros/noetic/setup.bash          ← 底层(underlay)：系统装的 ROS 和 mavros、pcl_ros 等
+        ↓ 被 devel/setup.bash 继承并追加
+/ws/Diff-Planner/devel/setup.bash   ← 覆盖层(overlay)：本工作空间自己编的包
+```
+
+`devel/setup.bash` 内部会先 source 它编译时记录下来的 underlay，再把自己的 `src` 和 `devel` **前置**
+到各个路径变量最前面。所以只 source overlay 这一条就够了，不用先 source `/opt/ros/noetic/setup.bash`。
+前置的顺序也意味着：同名包以本工作空间的为准，这正是我们改上游代码后能生效的原因。
+
+### 三、为什么必须用 `source`，不能直接执行
+
+```bash
+source devel/setup.bash    # ✅ 在当前 shell 里执行，环境变量留下来
+. devel/setup.bash         # ✅ 同上，POSIX 写法
+./devel/setup.bash         # ❌ 开一个子 shell 执行，子 shell 一退出环境全丢
+bash devel/setup.bash      # ❌ 同上
+```
+
+环境变量只能由进程自己修改，且只向下传给子进程、**永远传不回父进程**。
+`roslaunch` 是当前 shell 的子进程，所以变量必须先设在当前 shell 里。
+
+### 四、作用范围：一个 shell 一次，退出即失效
+
+这条命令的效果**只存在于执行它的那个 shell 进程**。因此：
+
+- 开第二个终端跑 `pub_trigger.sh` / `pub_swarm_trigger.sh` → 那个终端要**再 source 一次**
+- `exit` 退出容器再进来 → 要重新 source
+- 用 `docker exec diffrobot bash -c '...'` 这种非交互方式跑命令 → 更要显式带上，实测：
+
+  ```bash
+  $ docker exec diffrobot bash -c 'echo "[$ROS_PACKAGE_PATH]"; which roslaunch'
+  []
+  # roslaunch 都不在 PATH 里
+  ```
+
+  非交互 shell 根本不读 `.bashrc`（Ubuntu 的 `.bashrc` 开头就是 `[ -z "$PS1" ] && return`），
+  所以任何写在 `.bashrc` 里的自动 source 对它都无效。正确写法：
+
+  ```bash
+  docker exec diffrobot bash -lc 'cd /ws/Diff-Planner && source devel/setup.bash && roslaunch diff_planner run_sim_single.launch'
+  ```
+
+### 五、`catkin_make` 之后一定要重新 source
+
+编译会重新生成 `devel/setup.bash`。尤其是**新增了包、新增了 msg/srv** 的时候，路径变量的内容会变。
+已经开着的旧终端里是编译**之前**的环境快照，不会自动更新，典型症状是「明明编译成功了却还是找不到包」。
+规矩很简单：**`catkin_make` 完，所有终端重新 source 一遍。**
+
+### 六、本机踩到的坑：镜像里的自动 source 在这个容器里是失效的
+
+Dockerfile 里本来是写了自动 source 的：
+
+```dockerfile
+RUN printf '%s\n' \
+      'source /opt/ros/noetic/setup.bash' \
+      '[ -f /ws/Diff-Planner/devel/setup.bash ] && source /ws/Diff-Planner/devel/setup.bash' \
+      'export ROS_MASTER_URI=http://localhost:11311' \
+      > /etc/profile.d/ros_ws.sh \
+ && echo '. /etc/profile.d/ros_ws.sh' >> /root/.bashrc
+```
+
+但今天查了正在跑的容器，`/root/.bashrc` 结尾并不是 `. /etc/profile.d/ros_ws.sh`，而是被替换成了一份
+**路径写错**的内联副本：
+
+```bash
+$ docker exec diffrobot tail -3 /root/.bashrc
+source /opt/ros/noetic/setup.bash
+[ -f /ws/devel/setup.bash ] && source /ws/devel/setup.bash     # ← 路径错了
+export ROS_MASTER_URI=http://localhost:11311
+
+$ docker exec diffrobot ls -d /ws/devel
+ls: cannot access '/ws/devel': No such file or directory
+```
+
+真实路径是 `/ws/Diff-Planner/devel/setup.bash`（工作空间在 `/ws` 下面还嵌了一层）。
+`[ -f ... ] && source ...` 这种写法在文件不存在时**静默跳过、不报任何错**，
+于是进容器后只有底层 ROS 环境，工作空间那一层永远没加载 —— 表现就是「看着一切正常，一 roslaunch 就说找不到包」。
+
+> 容器是长期存活的（`run.sh` 里存在就 `docker start`），这份改动落在容器的可写层里，
+> 重启容器不会恢复成镜像里的版本。要么 `docker rm diffrobot` 让 `run.sh` 从镜像重建，
+> 要么就按现在这样每次手动 source。**手动 source 是更保险的做法**：它不依赖任何隐式配置，
+> 换一台机器、换一个镜像版本都照样对。
+
+### 七、`sh_files/` 下的脚本是例外
+
+`sh_files/*.sh` 自己会 source，但它们是 **zsh** 脚本，而且用的是**相对路径**：
+
+```bash
+#!/bin/zsh
+source devel/setup.zsh      # ← 相对路径，所以必须在 /ws/Diff-Planner 下执行
+```
+
+所以跑这些脚本时不需要先 `source devel/setup.bash`，但**必须先 `cd /ws/Diff-Planner`**，
+否则 `source devel/setup.zsh` 会失败。注意是 `setup.zsh` 不是 `setup.bash` —— catkin
+给每种 shell 各生成一份，内容等价。
+
 
 ---
 
@@ -79,6 +226,7 @@ else if (target_type_ == TARGET_TYPE::PRESET_TARGET)   // flight_type = 2
 
 ```bash
 cd /ws/Diff-Planner
+source devel/setup.bash
 roslaunch diff_planner run_sim_single.launch
 ```
 
@@ -273,6 +421,7 @@ if (counts_pre == pytVector.size() - 1 && distance_ < next_distance
 
 ```bash
 cd /ws/Diff-Planner
+source devel/setup.bash
 roslaunch diff_planner run_sim_swarm.launch
 ```
 
@@ -375,17 +524,24 @@ rostopic pub /traj_start_trigger geometry_msgs/PoseStamped "..."
 
 ## 6. 踩过的坑小结
 
-1. **`sh_files/*.sh` 必须在 `/ws/Diff-Planner` 下执行** —— 脚本里是相对路径 `source devel/setup.zsh`，
+1. **每次 roslaunch 前都要 `source devel/setup.bash`** —— 这个容器里 `.bashrc` 的自动 source
+   路径写错了（`/ws/devel` vs 实际的 `/ws/Diff-Planner/devel`），`[ -f ] &&` 静默失败，
+   工作空间那层环境根本没加载。详见 0.1 节。
+2. **`source` 的作用范围只有当前 shell** —— 新开终端、`exit` 后重进、`docker exec bash -c`
+   非交互执行，都要各自再 source 一次。
+3. **`catkin_make` 之后所有终端重新 source** —— 旧终端里是编译前的环境快照，
+   典型症状是「编译明明成功了却还是找不到包」。
+4. **`sh_files/*.sh` 必须在 `/ws/Diff-Planner` 下执行** —— 脚本里是相对路径 `source devel/setup.zsh`，
    在别的目录跑会 source 失败。
-2. **脚本是 zsh 不是 bash**。镜像里装了 zsh，所以能跑；换个没装 zsh 的环境会直接 `bad interpreter`。
-3. **`fligt_type` 是上游的错拼**，参数名和代码里全都是它，别改。
-4. **`back.sh` 会把飞行模式重置成 1**，返程后想再跑模式 2/3/4 必须重启 launch。
-5. **仿真下 `auto_landing` 不生效**，因为 px4ctrl 没启动，`px4_is_auto_hover` 恒为 false。
-6. **`auto_planning` / `auto_landing` 上游 launch 里缺失**，而代码用 `getParam` 强制读，
+5. **脚本是 zsh 不是 bash**。镜像里装了 zsh，所以能跑；换个没装 zsh 的环境会直接 `bad interpreter`。
+6. **`fligt_type` 是上游的错拼**，参数名和代码里全都是它，别改。
+7. **`back.sh` 会把飞行模式重置成 1**，返程后想再跑模式 2/3/4 必须重启 launch。
+8. **仿真下 `auto_landing` 不生效**，因为 px4ctrl 没启动，`px4_is_auto_hover` 恒为 false。
+9. **`auto_planning` / `auto_landing` 上游 launch 里缺失**，而代码用 `getParam` 强制读，
    不补参数节点直接报错退出。
-7. **集群模式改 `points.yaml` 无效** —— 它压根不加载 multipoint。
-8. **`pub_swarm_trigger.sh` 不会自己退出**，记得 Ctrl-C。
-9. **航点间距不能小于 `next_distance`（0.3m）**，否则会被判定为「已到达」直接跳过。
+10. **集群模式改 `points.yaml` 无效** —— 它压根不加载 multipoint。
+11. **`pub_swarm_trigger.sh` 不会自己退出**，记得 Ctrl-C。
+12. **航点间距不能小于 `next_distance`（0.3m）**，否则会被判定为「已到达」直接跳过。
 
 ---
 

@@ -22,6 +22,7 @@
 
 | 日期 | 主题 |
 |---|---|
+| 2026-08-27 | [unitree_rl_lab 装进 Isaac Lab 容器：从搭建到验证](notes/isaaclab/2026-08-27-unitree-rl-lab.md) |
 | 2026-08-25 | [Isaac Lab 3.0.0 跑在 rootless Docker 上](notes/isaaclab/2026-08-25-isaac-lab-setup.md) |
 
 ## 基础设施
@@ -40,5 +41,6 @@
 - 引用源码时带上**文件路径和行号**，方便日后对照上游改动
 - 笔记之间用相对链接互指
 - 新增笔记后在上面对应表格里加一行
+- 补丁、脚本等配套文件放 `notes/<项目>/files/<笔记名>/`，笔记里链过去
 
 模板见 [`templates/note.md`](templates/note.md)。

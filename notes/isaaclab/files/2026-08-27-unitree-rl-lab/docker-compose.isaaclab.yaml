@@ -1,0 +1,22 @@
+# Overlay for IsaacLab/docker/docker-compose.yaml
+#
+# Mounts this repo + the Unitree robot assets into the existing isaac-lab-base
+# container, so the host stays the single source of truth for the code and the
+# container only provides the Isaac Sim / Isaac Lab runtime.
+#
+# Usage (from ~/IsaacLab/docker):
+#   ./container.py start base --files ../../unitree_rl_lab/docker/docker-compose.isaaclab.yaml
+#
+# Paths are absolute on purpose: compose resolves relative bind sources against
+# the *project* directory (~/IsaacLab/docker), not against this file.
+
+services:
+  isaac-lab-base:
+    volumes:
+      - type: bind
+        source: /home/major/unitree_rl_lab
+        target: /workspace/unitree_rl_lab
+      - type: bind
+        source: /home/major/unitree_model
+        target: /workspace/unitree_model
+        read_only: true

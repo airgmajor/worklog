@@ -1,0 +1,438 @@
+diff --git a/scripts/rsl_rl/play.py b/scripts/rsl_rl/play.py
+index fd5ff85..6cdfa07 100644
+--- a/scripts/rsl_rl/play.py
++++ b/scripts/rsl_rl/play.py
+@@ -10,6 +10,8 @@
+ import argparse
+ from importlib.metadata import version
+ 
++from packaging import version as pkg_version
++
+ from isaaclab.app import AppLauncher
+ 
+ # local imports
+@@ -56,8 +58,14 @@ import isaaclab_tasks  # noqa: F401
+ from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
+ from isaaclab.utils.assets import retrieve_file_path
+ from isaaclab.utils.dict import print_dict
+-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
++from isaaclab_rl.rsl_rl import (
++    RslRlOnPolicyRunnerCfg,
++    RslRlVecEnvWrapper,
++    export_policy_as_jit,
++    export_policy_as_onnx,
++    handle_deprecated_rsl_rl_cfg,
++)
++from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+ from isaaclab_tasks.utils import get_checkpoint_path
+ 
+ import unitree_rl_lab.tasks  # noqa: F401
+@@ -75,6 +83,8 @@ def main():
+         entry_point_key="play_env_cfg_entry_point",
+     )
+     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
++    # migrate the legacy `policy` config to the installed rsl-rl schema (see train.py)
++    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, version("rsl-rl-lib"))
+ 
+     # specify directory for logging experiments
+     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
+@@ -129,27 +139,35 @@ def main():
+     # obtain the trained policy for inference
+     policy = runner.get_inference_policy(device=env.unwrapped.device)
+ 
+-    # extract the neural network module
+-    # we do this in a try-except to maintain backwards compatibility.
+-    try:
+-        # version 2.3 onwards
+-        policy_nn = runner.alg.policy
+-    except AttributeError:
+-        # version 2.2 and below
+-        policy_nn = runner.alg.actor_critic
+-
+-    # extract the normalizer
+-    if hasattr(policy_nn, "actor_obs_normalizer"):
+-        normalizer = policy_nn.actor_obs_normalizer
+-    elif hasattr(policy_nn, "student_obs_normalizer"):
+-        normalizer = policy_nn.student_obs_normalizer
+-    else:
+-        normalizer = None
+-
+     # export policy to onnx/jit
+     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
++    rsl_rl_version = pkg_version.parse(version("rsl-rl-lib"))
++
++    if rsl_rl_version >= pkg_version.parse("4.0.0"):
++        # rsl-rl >= 4.0.0 owns the export; `alg.policy` / `alg.actor_critic` no longer exist
++        policy_nn = None
++        runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
++        runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
++    else:
++        # extract the neural network module
++        # we do this in a try-except to maintain backwards compatibility.
++        try:
++            # version 2.3 onwards
++            policy_nn = runner.alg.policy
++        except AttributeError:
++            # version 2.2 and below
++            policy_nn = runner.alg.actor_critic
++
++        # extract the normalizer
++        if hasattr(policy_nn, "actor_obs_normalizer"):
++            normalizer = policy_nn.actor_obs_normalizer
++        elif hasattr(policy_nn, "student_obs_normalizer"):
++            normalizer = policy_nn.student_obs_normalizer
++        else:
++            normalizer = None
++
++        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
++        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+ 
+     dt = env.unwrapped.step_dt
+ 
+@@ -166,7 +184,12 @@ def main():
+             # agent stepping
+             actions = policy(obs)
+             # env stepping
+-            obs, _, _, _ = env.step(actions)
++            obs, _, dones, _ = env.step(actions)
++            # reset recurrent states for episodes that have terminated
++            if rsl_rl_version >= pkg_version.parse("4.0.0"):
++                policy.reset(dones)
++            else:
++                policy_nn.reset(dones)
+         if args_cli.video:
+             timestep += 1
+             # Exit the play loop after recording one video
+diff --git a/scripts/rsl_rl/train.py b/scripts/rsl_rl/train.py
+index 28dae91..30b6b6d 100644
+--- a/scripts/rsl_rl/train.py
++++ b/scripts/rsl_rl/train.py
+@@ -104,7 +104,7 @@ from isaaclab.envs import (
+ )
+ from isaaclab.utils.dict import print_dict
+ from isaaclab.utils.io import dump_yaml
+-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
++from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
+ from isaaclab_tasks.utils import get_checkpoint_path
+ from isaaclab_tasks.utils.hydra import hydra_task_config
+ 
+@@ -122,6 +122,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+     """Train with RSL-RL agent."""
+     # override configurations with non-hydra CLI arguments
+     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
++    # rsl-rl >= 4.0.0 replaced `policy` with per-model `actor`/`critic` configs.
++    # This migrates the repo's legacy RslRlPpoActorCriticCfg to the installed version's schema.
++    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
+     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+     agent_cfg.max_iterations = (
+         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/assets/robots/unitree.py b/source/unitree_rl_lab/unitree_rl_lab/assets/robots/unitree.py
+index e78413a..1d64c74 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/assets/robots/unitree.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/assets/robots/unitree.py
+@@ -17,8 +17,10 @@ from isaaclab.utils import configclass
+ 
+ from unitree_rl_lab.assets.robots import unitree_actuators
+ 
+-UNITREE_MODEL_DIR = "path/to/unitree_model"  # Replace with the actual path to your unitree_model directory
+-UNITREE_ROS_DIR = "path/to/unitree_ros"  # Replace with the actual path to your unitree_ros package
++# Asset roots. Overridable by environment variable so the same checkout works both
++# inside the Isaac Lab container (/workspace/...) and on the host (~/...).
++UNITREE_MODEL_DIR = os.environ.get("UNITREE_MODEL_DIR", "/workspace/unitree_model")
++UNITREE_ROS_DIR = os.environ.get("UNITREE_ROS_DIR", "/workspace/unitree_ros")
+ 
+ 
+ @configclass
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/rewards.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/rewards.py
+index 95ddd8a..fffa729 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/rewards.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/rewards.py
+@@ -106,9 +106,10 @@ def feet_height_body(
+         :, :
+     ].unsqueeze(1)
+     footvel_in_body_frame = torch.zeros(env.num_envs, len(asset_cfg.body_ids), 3, device=env.device)
++    root_quat_w = asset.data.root_quat_w.torch
+     for i in range(len(asset_cfg.body_ids)):
+-        footpos_in_body_frame[:, i, :] = quat_apply_inverse(asset.data.root_quat_w, cur_footpos_translated[:, i, :])
+-        footvel_in_body_frame[:, i, :] = quat_apply_inverse(asset.data.root_quat_w, cur_footvel_translated[:, i, :])
++        footpos_in_body_frame[:, i, :] = quat_apply_inverse(root_quat_w, cur_footpos_translated[:, i, :])
++        footvel_in_body_frame[:, i, :] = quat_apply_inverse(root_quat_w, cur_footvel_translated[:, i, :])
+     foot_z_target_error = torch.square(footpos_in_body_frame[:, :, 2] - target_height).view(env.num_envs, -1)
+     foot_velocity_tanh = torch.tanh(tanh_mult * torch.norm(footvel_in_body_frame[:, :, :2], dim=2))
+     reward = torch.sum(foot_z_target_error * foot_velocity_tanh, dim=1)
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/velocity_env_cfg.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/velocity_env_cfg.py
+index ea9b65b..a71e193 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/velocity_env_cfg.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/g1/29dof/velocity_env_cfg.py
+@@ -1,5 +1,7 @@
+ import math
+ 
++from isaaclab_physx.physics import PhysxCfg
++
+ import isaaclab.sim as sim_utils
+ import isaaclab.terrains as terrain_gen
+ from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+@@ -16,7 +18,7 @@ from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
+ from isaaclab.terrains import TerrainImporterCfg
+ from isaaclab.utils import configclass
+ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
+-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
++from isaaclab.utils.noise import UniformNoiseCfg as Unoise
+ 
+ from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_CFG as ROBOT_CFG
+ from unitree_rl_lab.tasks.locomotion import mdp
+@@ -379,7 +381,7 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
+         self.sim.dt = 0.005
+         self.sim.render_interval = self.decimation
+         self.sim.physics_material = self.scene.terrain.physics_material
+-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
++        self.sim.physics = PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
+ 
+         # update sensor update periods
+         # we tick all the sensors based on the smallest update period (physics update period)
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/go2/velocity_env_cfg.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/go2/velocity_env_cfg.py
+index 7496d76..e119c98 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/go2/velocity_env_cfg.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/go2/velocity_env_cfg.py
+@@ -1,5 +1,7 @@
+ import math
+ 
++from isaaclab_physx.physics import PhysxCfg
++
+ import isaaclab.sim as sim_utils
+ import isaaclab.terrains as terrain_gen
+ from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+@@ -16,7 +18,7 @@ from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
+ from isaaclab.terrains import TerrainImporterCfg
+ from isaaclab.utils import configclass
+ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
+-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
++from isaaclab.utils.noise import UniformNoiseCfg as Unoise
+ 
+ from unitree_rl_lab.assets.robots.unitree import UNITREE_GO2_CFG as ROBOT_CFG
+ from unitree_rl_lab.tasks.locomotion import mdp
+@@ -388,7 +390,7 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
+         self.sim.dt = 0.005
+         self.sim.render_interval = self.decimation
+         self.sim.physics_material = self.scene.terrain.physics_material
+-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
++        self.sim.physics = PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
+ 
+         # update sensor update periods
+         # we tick all the sensors based on the smallest update period (physics update period)
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/h1/velocity_env_cfg.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/h1/velocity_env_cfg.py
+index 9241aa4..52558b6 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/h1/velocity_env_cfg.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/robots/h1/velocity_env_cfg.py
+@@ -1,5 +1,7 @@
+ import math
+ 
++from isaaclab_physx.physics import PhysxCfg
++
+ import isaaclab.sim as sim_utils
+ import isaaclab.terrains as terrain_gen
+ from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+@@ -16,7 +18,7 @@ from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
+ from isaaclab.terrains import TerrainImporterCfg
+ from isaaclab.utils import configclass
+ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
+-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
++from isaaclab.utils.noise import UniformNoiseCfg as Unoise
+ 
+ from unitree_rl_lab.assets.robots.unitree import UNITREE_H1_CFG as ROBOT_CFG
+ from unitree_rl_lab.tasks.locomotion import mdp
+@@ -390,7 +392,7 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
+         self.sim.dt = 0.005
+         self.sim.render_interval = self.decimation
+         self.sim.physics_material = self.scene.terrain.physics_material
+-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
++        self.sim.physics = PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
+ 
+         # --- Robot Cfg ---
+         self.gait_f = 2.0
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/mdp/events.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/mdp/events.py
+index 4b87936..e94dc42 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/mdp/events.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/mdp/events.py
+@@ -3,7 +3,6 @@ from __future__ import annotations
+ import torch
+ from typing import TYPE_CHECKING, Literal
+ 
+-import isaaclab.utils.math as math_utils
+ from isaaclab.assets import Articulation
+ from isaaclab.envs.mdp.events import _randomize_prop_by_op
+ from isaaclab.managers import SceneEntityCfg
+@@ -51,43 +50,8 @@ def randomize_joint_default_pos(
+         # update the offset in action since it is not updated automatically
+         env.action_manager.get_term("JointPositionAction")._offset[env_ids, joint_ids] = pos
+ 
+-
+-def randomize_rigid_body_com(
+-    env: ManagerBasedEnv,
+-    env_ids: torch.Tensor | None,
+-    com_range: dict[str, tuple[float, float]],
+-    asset_cfg: SceneEntityCfg,
+-):
+-    """Randomize the center of mass (CoM) of rigid bodies by adding a random value sampled from the given ranges.
+-
+-    .. note::
+-        This function uses CPU tensors to assign the CoM. It is recommended to use this function
+-        only during the initialization of the environment.
+-    """
+-    # extract the used quantities (to enable type-hinting)
+-    asset: Articulation = env.scene[asset_cfg.name]
+-    # resolve environment ids
+-    if env_ids is None:
+-        env_ids = torch.arange(env.scene.num_envs, device="cpu")
+-    else:
+-        env_ids = env_ids.cpu()
+-
+-    # resolve body indices
+-    if asset_cfg.body_ids == slice(None):
+-        body_ids = torch.arange(asset.num_bodies, dtype=torch.int, device="cpu")
+-    else:
+-        body_ids = torch.tensor(asset_cfg.body_ids, dtype=torch.int, device="cpu")
+-
+-    # sample random CoM values
+-    range_list = [com_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
+-    ranges = torch.tensor(range_list, device="cpu")
+-    rand_samples = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 3), device="cpu").unsqueeze(1)
+-
+-    # get the current com of the bodies (num_assets, num_bodies)
+-    coms = asset.root_physx_view.get_coms().clone()
+-
+-    # Randomize the com in range
+-    coms[:, body_ids, :3] += rand_samples
+-
+-    # Set the new coms
+-    asset.root_physx_view.set_coms(coms, env_ids)
++# NOTE: `randomize_rigid_body_com` used to be vendored here (a verbatim copy of the
++# Isaac Lab 2.x helper). Isaac Lab 3.0 ships its own physics-backend-aware version as a
++# ManagerTermBase, and the 2.x copy breaks on it (`root_physx_view.get_coms()` no longer
++# returns a torch tensor). Dropping the copy lets `from isaaclab.envs.mdp import *` in
++# this package's __init__ provide the upstream one, which has the same call signature.
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/mdp/terminations.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/mdp/terminations.py
+index e3f5ad0..bf4cf07 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/mdp/terminations.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/mdp/terminations.py
+@@ -35,9 +35,9 @@ def bad_anchor_ori(
+     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
+ 
+     command: MotionCommand = env.command_manager.get_term(command_name)
+-    motion_projected_gravity_b = quat_apply_inverse(command.anchor_quat_w, asset.data.GRAVITY_VEC_W)
++    motion_projected_gravity_b = quat_apply_inverse(command.anchor_quat_w, asset.data.GRAVITY_VEC_W.torch)
+ 
+-    robot_projected_gravity_b = quat_apply_inverse(command.robot_anchor_quat_w, asset.data.GRAVITY_VEC_W)
++    robot_projected_gravity_b = quat_apply_inverse(command.robot_anchor_quat_w, asset.data.GRAVITY_VEC_W.torch)
+ 
+     return (motion_projected_gravity_b[:, 2] - robot_projected_gravity_b[:, 2]).abs() > threshold
+ 
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/dance_102/tracking_env_cfg.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/dance_102/tracking_env_cfg.py
+index 7bb98ad..67af8af 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/dance_102/tracking_env_cfg.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/dance_102/tracking_env_cfg.py
+@@ -2,6 +2,8 @@ from __future__ import annotations
+ 
+ import os
+ 
++from isaaclab_physx.physics import PhysxCfg
++
+ import isaaclab.sim as sim_utils
+ from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+ from isaaclab.envs import ManagerBasedRLEnvCfg
+@@ -19,7 +21,7 @@ from isaaclab.terrains import TerrainImporterCfg
+ # Pre-defined configs
+ ##
+ from isaaclab.utils import configclass
+-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
++from isaaclab.utils.noise import UniformNoiseCfg as Unoise
+ 
+ import unitree_rl_lab.tasks.mimic.mdp as mdp
+ from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_MIMIC_ACTION_SCALE
+@@ -334,7 +336,7 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
+         self.sim.dt = 0.005
+         self.sim.render_interval = self.decimation
+         self.sim.physics_material = self.scene.terrain.physics_material
+-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
++        self.sim.physics = PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
+ 
+ 
+ class RobotPlayEnvCfg(RobotEnvCfg):
+diff --git a/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/gangnanm_style/tracking_env_cfg.py b/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/gangnanm_style/tracking_env_cfg.py
+index 8dec2a5..1cbe037 100644
+--- a/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/gangnanm_style/tracking_env_cfg.py
++++ b/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/gangnanm_style/tracking_env_cfg.py
+@@ -2,6 +2,8 @@ from __future__ import annotations
+ 
+ import os
+ 
++from isaaclab_physx.physics import PhysxCfg
++
+ import isaaclab.sim as sim_utils
+ from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+ from isaaclab.envs import ManagerBasedRLEnvCfg
+@@ -19,7 +21,7 @@ from isaaclab.terrains import TerrainImporterCfg
+ # Pre-defined configs
+ ##
+ from isaaclab.utils import configclass
+-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
++from isaaclab.utils.noise import UniformNoiseCfg as Unoise
+ 
+ import unitree_rl_lab.tasks.mimic.mdp as mdp
+ from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_MIMIC_ACTION_SCALE
+@@ -334,7 +336,7 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
+         self.sim.dt = 0.005
+         self.sim.render_interval = self.decimation
+         self.sim.physics_material = self.scene.terrain.physics_material
+-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
++        self.sim.physics = PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
+ 
+ 
+ class RobotPlayEnvCfg(RobotEnvCfg):
+diff --git a/unitree_rl_lab.sh b/unitree_rl_lab.sh
+index 8563ea3..47e6e5b 100755
+--- a/unitree_rl_lab.sh
++++ b/unitree_rl_lab.sh
+@@ -2,10 +2,19 @@
+ 
+ export UNITREE_RL_LAB_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+ 
++# Resolve the python interpreter that has Isaac Lab installed.
++#  1. a conda env (the upstream/host workflow)
++#  2. Isaac Sim's bundled python (the Isaac Lab *container*, where there is no conda
++#     and no bare `python` on PATH)
++#  3. the isaaclab.sh wrapper, as a last resort
+ if ! [[ -z "${CONDA_PREFIX}" ]]; then
+     python_exe=${CONDA_PREFIX}/bin/python
++elif [[ -x "/isaac-sim/python.sh" ]]; then
++    python_exe=/isaac-sim/python.sh
++elif [[ -n "${ISAACLAB_PATH}" && -x "${ISAACLAB_PATH}/isaaclab.sh" ]]; then
++    python_exe="${ISAACLAB_PATH}/isaaclab.sh -p"
+ else
+-    echo "[Error] No conda environment activated. Please activate the conda environment first."
++    echo "[Error] No Isaac Lab python found. Activate the conda env, or run inside the Isaac Lab container."
+     # exit 1
+ fi
+ 
+@@ -61,10 +70,14 @@ _ut_setup_conda_env() {
+ # pass the arguments
+ case "$1" in
+     -i|--install)
+-        git lfs install # ensure git lfs is installed
+-        pip install -e ${UNITREE_RL_LAB_PATH}/source/unitree_rl_lab/
+-        _ut_setup_conda_env
+-        activate-global-python-argcomplete
++        # git-lfs is optional: the checked-in .onnx policies are plain blobs, not LFS pointers
++        command -v git-lfs >/dev/null 2>&1 && git lfs install
++        ${python_exe} -m pip install -e ${UNITREE_RL_LAB_PATH}/source/unitree_rl_lab/
++        # conda-only steps: skipped inside the Isaac Lab container
++        if ! [[ -z "${CONDA_PREFIX}" ]]; then
++            _ut_setup_conda_env
++            command -v activate-global-python-argcomplete >/dev/null 2>&1 && activate-global-python-argcomplete
++        fi
+         ;;
+     -l|--list)
+         shift
